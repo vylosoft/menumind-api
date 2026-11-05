@@ -141,7 +141,7 @@ const dbRowToClient = (row) => {
       category: meta.restaurant || undefined,
       orderType: row.order_type,
       salesChannel: row.raw_item_name,
-      discount: 0,
+      discount: Number(row.discount_amount) || 0,
       returnAmount: 0,
       outlet: row.outlet_name,
       isReturn: false,

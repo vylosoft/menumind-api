@@ -321,13 +321,32 @@ const uploadPayoutFiles = async (userId, files, opts) => {
       let row = toDbRow(g, { restaurantId, platform: pf.platform, periodType: pf.periodType, ref });
       const refs = existing?.payout_reference_id ? existing.payout_reference_id.split(",").filter(Boolean) : [];
 
+      // Same week already counted in this month (e.g. the same statement saved under another file name)
+      const weekNorm = (w) => String(w || "").replace(/\s+/g, " ").trim().toLowerCase();
+      const sameWeek =
+        existing &&
+        pf.periodType === "weekly" &&
+        row.week_label &&
+        String(existing.week_label || "")
+          .split(",")
+          .map(weekNorm)
+          .includes(weekNorm(row.week_label));
+      if (existing && sameWeek && !refs.includes(ref) && !opts.replace) {
+        throw new AppError(
+          `${pf.platform} statement for ${g.outlet_id} "${row.week_label}" is already counted in ${g.month}. Nothing was added. Re-send with replace=true to overwrite the ${g.month} statement with "${pf.file.originalname}".`,
+          409,
+          [{ fileName: pf.file.originalname, outletId: g.outlet_id, month: g.month, platform: pf.platform, week: row.week_label }]
+        );
+      }
+
       if (existing && refs.includes(ref) && !opts.replace) {
         throw new AppError(`"${pf.file.originalname}" was already uploaded. Re-send with replace=true to overwrite.`, 409, [
           { fileName: pf.file.originalname, outletId: g.outlet_id, month: g.month, platform: pf.platform },
         ]);
       }
 
-      const accumulate = existing && !refs.includes(ref) && pf.periodType === "weekly" && existing.period_type === "weekly";
+      const accumulate =
+        existing && !refs.includes(ref) && !sameWeek && pf.periodType === "weekly" && existing.period_type === "weekly";
       if (existing && !accumulate && !opts.replace) {
         throw new AppError(
           `${pf.platform} payout for ${g.outlet_id} ${g.month} already exists. Re-send with replace=true to overwrite it with "${pf.file.originalname}".`,
@@ -362,7 +381,14 @@ const uploadPayoutFiles = async (userId, files, opts) => {
     const payouts = rows.map((p) => ({ ...toClientPayout(byKey.get(`${p.row.outlet_id}|${p.row.month_year}|${p.row.platform}`)), sourceFileName: pf.file.originalname }));
     const warnings = [...pf.warnings];
     rows.filter((p) => p.accumulated).forEach((p) => warnings.push(`Added to existing ${p.row.month_year} ${p.row.outlet_id} weekly total.`));
-    rows.filter((p) => p.replaced).forEach((p) => warnings.push(`Replaced existing ${p.row.month_year} ${p.row.outlet_id} statement.`));
+    rows
+      .filter((p) => p.replaced)
+      .forEach((p) =>
+        warnings.push(
+          `Replaced existing ${p.row.month_year} ${p.row.outlet_id} statement.` +
+            (p.pf.periodType === "weekly" ? " Upload the other weeks of this month again so they are counted once each." : "")
+        )
+      );
     return {
       batchId: payouts[0]?.id,
       fileName: pf.file.originalname,

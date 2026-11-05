@@ -111,7 +111,7 @@ const isSubOrderSummaryWorkbook = (wb) => {
 /**
  * Parses a sub-order-wise summary into normalized channel sales rows and validates them against the report's Total row.
  */
-const parseChannelSummaryWorkbook = (wb, fileName, { defaultPeriod } = {}) => {
+const parseChannelSummaryWorkbook = (wb, fileName, { defaultPeriod, skipFooterRows = 0 } = {}) => {
   const found = isSubOrderSummaryWorkbook(wb);
   if (!found) throw new AppError(`"${fileName}" is not a sub-order-wise sales summary`, 422);
   const { sheetName, headerIdx, headers, map } = found;
@@ -132,7 +132,12 @@ const parseChannelSummaryWorkbook = (wb, fileName, { defaultPeriod } = {}) => {
   let currentRestaurant = "";
   let currentOrderType = "";
 
-  for (let r = headerIdx + 1; r < matrix.length; r++) {
+  // Rows the user chose to skip at the bottom of the sheet (same rule as the upload screen preview)
+  const skip = Math.max(0, Number(skipFooterRows) || 0);
+  const endIdx = Math.max(headerIdx + 1, matrix.length - skip);
+  if (skip > 0) warnings.push(`Last ${skip} row(s) of the sheet skipped as set on the upload screen`);
+
+  for (let r = headerIdx + 1; r < endIdx; r++) {
     const row = matrix[r];
     if (isBlankRow(row)) continue;
 
@@ -184,7 +189,14 @@ const parseChannelSummaryWorkbook = (wb, fileName, { defaultPeriod } = {}) => {
   const r2 = (n) => Math.round(n * 100) / 100;
   const sumNet = r2(rows.reduce((s, x) => s + x.netSales, 0));
   const sumBills = rows.reduce((s, x) => s + x.bills, 0);
-  if (reportTotal) {
+  if (skip > 0) {
+    // The report Total covers rows the user excluded, so it cannot be used as the check.
+    if (reportTotal) {
+      warnings.push(
+        `Saved ₹${sumNet} / ${sumBills} bills after skipping rows (report Total ₹${reportTotal.netSales} / ${reportTotal.bills} bills includes the skipped rows).`
+      );
+    }
+  } else if (reportTotal) {
     if (Math.abs(sumNet - reportTotal.netSales) > 1 || sumBills !== Math.round(reportTotal.bills)) {
       throw new AppError(
         `"${fileName}": parsed rows (₹${sumNet}, ${sumBills} bills) do not match the report Total (₹${reportTotal.netSales}, ${reportTotal.bills} bills). File may be truncated or edited.`,

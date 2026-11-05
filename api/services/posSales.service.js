@@ -167,19 +167,24 @@ const dbRowToClient = (row) => {
   });
 };
 
-/** Finds earlier uploads of the same file content for this restaurant. */
-const findExistingBatches = async (restaurantId, hashes) => {
-  const found = [];
-  for (const part of chunk(hashes, 50)) {
-    const { data, error } = await supabaseAdmin
-      .from(BATCH_TABLE)
-      .select("id, file_name, created_at, layout_config_json")
-      .eq("restaurant_id", restaurantId)
-      .in("layout_config_json->_meta->>fileHash", part);
-    if (error) throw dbError("checking duplicate uploads", error);
-    found.push(...data);
-  }
-  return found;
+/**
+ * Earlier uploads that would double-count the incoming files: same content hash, same file name,
+ * or a sales period that overlaps (dated uploads only).
+ */
+const findConflictingBatches = async (restaurantId, incoming) => {
+  const { data, error } = await supabaseAdmin
+    .from(BATCH_TABLE)
+    .select("id, file_name, created_at, date_start, date_end, layout_config_json")
+    .eq("restaurant_id", restaurantId);
+  if (error) throw dbError("checking duplicate uploads", error);
+  return (data || []).filter((b) =>
+    incoming.some(({ file, from, to }) => {
+      if (b.layout_config_json?._meta?.fileHash === file.hash) return true;
+      if (String(b.file_name || "").trim().toLowerCase() === String(file.originalname || "").trim().toLowerCase()) return true;
+      if (from && to && b.date_start && b.date_end) return b.date_start <= to && b.date_end >= from;
+      return false;
+    })
+  );
 };
 
 const deleteBatches = async (restaurantId, ids) => {
@@ -448,14 +453,6 @@ const uploadPosFiles = async (userId, files, opts) => {
   const prepared = files.map((f) => ({ ...f, hash: sha256(f.buffer) }));
   assertUniqueInRequest(prepared);
 
-  const existing = await findExistingBatches(tenant.restaurantId, prepared.map((f) => f.hash));
-  if (existing.length && !opts.replace) {
-    throw new AppError(
-      "One or more files were already uploaded. Re-send with replace=true to overwrite.",
-      409,
-      existing.map((d) => ({ batchId: d.id, fileName: d.file_name, uploadedAt: d.created_at }))
-    );
-  }
 
   // 1. Parse
   const summaryFiles = [];
@@ -463,7 +460,10 @@ const uploadPosFiles = async (userId, files, opts) => {
   for (const file of prepared) {
     const wb = readWorkbook(file);
     if (isSubOrderSummaryWorkbook(wb)) {
-      const parsed = parseChannelSummaryWorkbook(wb, file.originalname, { defaultPeriod: opts.period });
+      const parsed = parseChannelSummaryWorkbook(wb, file.originalname, {
+        defaultPeriod: opts.period,
+        skipFooterRows: layout?.skipFooterRows || 0,
+      });
       // Outlet corrections made by the user in the review screen win over automatic detection
       parsed.rows.forEach((r) => {
         const override = overrides[String(r.subOrderType).toLowerCase().trim()];
@@ -488,6 +488,24 @@ const uploadPosFiles = async (userId, files, opts) => {
   }
 
   const { merged, reconciliation } = buildReconciliation(parsedFiles);
+
+  // 1b. Never store the same sales twice: same file content, same file name, or an overlapping sales
+  //     period (any report type: item-wise vs Sub-Order Wise). Warn (409) unless the user chose to replace.
+  const incoming = [
+    ...summaryFiles.map(({ file, parsed }) => ({ file, from: parsed.period?.from || null, to: parsed.period?.to || null })),
+    ...parsedFiles.map(({ file, records }) => {
+      const d = records.map((r) => r.saleDate).filter(Boolean).sort();
+      return { file, from: d[0] || null, to: d[d.length - 1] || null };
+    }),
+  ];
+  const existing = await findConflictingBatches(tenant.restaurantId, incoming);
+  if (existing.length && !opts.replace) {
+    throw new AppError(
+      "This sales data is already saved (same file or same sales period). Re-send with replace=true to overwrite it.",
+      409,
+      existing.map((d) => ({ batchId: d.id, fileName: d.file_name, uploadedAt: d.created_at, periodFrom: d.date_start, periodTo: d.date_end }))
+    );
+  }
 
   // 2. Persist
   if (existing.length) await deleteBatches(tenant.restaurantId, existing.map((d) => d.id));

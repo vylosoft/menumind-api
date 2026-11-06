@@ -130,17 +130,26 @@ const toClientRecord = (r) => ({
 const dbRowToClient = (row) => {
   const meta = row.raw_metadata || {};
   if (row.raw_category === CHANNEL_SUMMARY) {
+    // Dine-in rows are split by Petpooja into VEG / NON VEG: show them as one "Dine In" item with two variants
+    const isDineIn = /dine\s*-?\s*in/i.test(String(row.order_type || ""));
+    // Brand of the dine-in rows = the restaurant they are listed under ("Banglar Jhale Jhole, Whitefield"),
+    // written the way the other Whitefield rows are ("Banglar Jhale Jhole W")
+    const restaurantName = String(meta.restaurant || "").trim();
+    const dineBrand = restaurantName
+      ? restaurantName.replace(/\s*,\s*whitefield\s*$/i, " W").replace(/\s+/g, " ").trim()
+      : "Dine In";
     return toClientRecord({
       rowId: row.id,
       sourceFile: meta.sourceFile || "",
-      rawItemName: row.raw_item_name,
+      rawItemName: isDineIn ? dineBrand : row.raw_item_name,
+      rawVariantName: isDineIn ? `Dine In ${row.raw_item_name}` : undefined,
       quantity: row.quantity,
       revenue: row.net_revenue,
       isNetSales: true,
       saleDate: row.sale_date,
       category: meta.restaurant || undefined,
       orderType: row.order_type,
-      salesChannel: row.raw_item_name,
+      salesChannel: isDineIn ? "Dine In" : row.raw_item_name,
       discount: Number(row.discount_amount) || 0,
       returnAmount: 0,
       outlet: row.outlet_name,

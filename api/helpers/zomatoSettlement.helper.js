@@ -28,14 +28,15 @@ const COLS = {
   longDistanceDiscount: { pos: 31, re: /^discount on long distance/ },
   capDiscount: { pos: 32, re: /^discount on service fee due to 30/ },
   paymentMechanismFee: { pos: 33, re: /^payment mechanism fee$/ },
-  serviceFeesTotal: { pos: 34, re: /^service fees payment mechanism fees/ },
+  serviceFeesTotal: { pos: 34, re: /^service fees? (and )?payment mechanism fees?/ },
   taxOnServiceFee: { pos: 35, re: /^taxes on service fee/ },
-  tcs: { pos: 36, re: /^tax collected at source/ },
+  tcs: { pos: 38, re: /^tax collected at source/ },
   tds: { pos: 40, re: /^tds 194o/ },
   gst95: { pos: 41, re: /^gst paid by zomato/ },
   otherDeductionsFrom: { pos: 44 },
-  otherDeductionsTo: { pos: 52 },
-  totalDeductions: { pos: 53 },
+  otherDeductionsTo: { pos: 51 },
+  totalDeductions: { pos: 53, re: /^net deductions/ },
+  netAdditions: { pos: 54, re: /^net additions/ },
   cashReceived: { pos: 54, re: /^amount received in cash/ },
   orderPayout: { pos: 55, re: /^order level payout/ },
   settlementStatus: { pos: 56, re: /^settlement status/ },
@@ -138,7 +139,18 @@ const parseZomatoSettlementWorkbook = (wb, fileName) => {
     const payout = toNumber(row[idx.orderPayout]);
 
     const calc = gross - discounts - serviceFee - pmf - n(row, "taxOnServiceFee") - n(row, "tcs") - n(row, "tds") - other;
-    if (payout === null || Math.abs(calc - payout) > 0.05) {
+    // Zomato's own identity for the order: Net order value - Net deductions + Net additions = Order payout
+    const viaTotals =
+      toNumber(row[idx.netOrderValue]) !== null && toNumber(row[idx.totalDeductions]) !== null
+        ? n(row, "netOrderValue") - n(row, "totalDeductions") + n(row, "netAdditions")
+        : null;
+    // Cancelled / rejected orders: Zomato pays only the cancellation refund (Net additions)
+    const isCancelled = /cancel|reject/i.test(String(row[idx.orderStatus] ?? ""));
+    const cancelRefundOk = isCancelled && payout !== null && Math.abs(n(row, "netAdditions") - payout) <= 0.05;
+    const reconciles =
+      payout !== null &&
+      (cancelRefundOk || Math.abs(calc - payout) <= 0.05 || (viaTotals !== null && Math.abs(viaTotals - payout) <= 0.05));
+    if (!reconciles) {
       mismatches.push({ row: r + 1, orderId: s(row, "orderId"), computed: Math.round(calc * 100) / 100, zomato: payout });
       continue;
     }
@@ -154,18 +166,19 @@ const parseZomatoSettlementWorkbook = (wb, fileName) => {
       weekLabel: meta.period,
       orderStatus: status,
       orderCount: status && /deliver/i.test(status) ? 1 : 0,
-      grossSales: gross,
-      customerDiscounts: discounts,
-      commissionAmount: serviceFee,
+      // A cancelled order is not a sale; only its refund (the payout) counts
+      grossSales: cancelRefundOk ? 0 : gross,
+      customerDiscounts: cancelRefundOk ? 0 : discounts,
+      commissionAmount: cancelRefundOk ? 0 : serviceFee,
       commissionRate: null,
-      paymentGatewayFee: pmf,
+      paymentGatewayFee: cancelRefundOk ? 0 : pmf,
       deliveryChargesCollected: 0,
       advertisingSpend: 0,
       cancellationCharges: 0,
-      otherPlatformFees: other,
-      gstOnCommission: n(row, "taxOnServiceFee"),
-      tcsDeduction: n(row, "tcs"),
-      tdsDeduction: n(row, "tds"),
+      otherPlatformFees: cancelRefundOk ? 0 : other,
+      gstOnCommission: cancelRefundOk ? 0 : n(row, "taxOnServiceFee"),
+      tcsDeduction: cancelRefundOk ? 0 : n(row, "tcs"),
+      tdsDeduction: cancelRefundOk ? 0 : n(row, "tds"),
       hyperpureRecovery: 0,
       netPayout: payout,
       raw: {

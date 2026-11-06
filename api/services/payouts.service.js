@@ -14,7 +14,7 @@ const { resolveTenant } = require("./tenant.service");
 const PAYOUT_TABLE = "platform_payout_reconciliation";
 const STATUS_TO_DB = { reconciled: "Reconciled", discrepancy: "Discrepancy", pending: "Pending" };
 const STATUS_FROM_DB = { reconciled: "reconciled", discrepancy: "discrepancy", pending: "pending" };
-const MAX_REFS = 7;
+const MAX_REFS = 11; // 11 x 8-char refs + commas fit payout_reference_id (100)
 
 const round2 = (n) => Math.round((Number(n || 0) + Number.EPSILON) * 100) / 100;
 const round4 = (n) => Math.round((Number(n || 0) + Number.EPSILON) * 10000) / 10000;
@@ -306,7 +306,12 @@ const uploadPayoutFiles = async (userId, files, opts) => {
   // 2. Plan writes against existing month rows (checks duplicates before anything is written)
   const plan = [];
   for (const pf of parsedFiles) {
-    const ref = `h:${pf.file.hash.slice(0, 12)}`;
+    // Fingerprint of the statement's own orders: the same statement downloaded again (new file bytes / name)
+    // gets the same reference, so it can never be counted twice. Falls back to the file hash.
+    const orderIds = [...new Set(pf.lines.map((l) => l.order_id).filter(Boolean))].sort();
+    const ref = orderIds.length
+      ? crypto.createHash("sha256").update(`${pf.platform}|${orderIds.join(",")}`).digest("hex").slice(0, 8)
+      : pf.file.hash.slice(0, 8);
     for (const g of pf.groups) {
       const { data: existing, error } = await supabaseAdmin
         .from(PAYOUT_TABLE)
@@ -321,24 +326,6 @@ const uploadPayoutFiles = async (userId, files, opts) => {
       let row = toDbRow(g, { restaurantId, platform: pf.platform, periodType: pf.periodType, ref });
       const refs = existing?.payout_reference_id ? existing.payout_reference_id.split(",").filter(Boolean) : [];
 
-      // Same week already counted in this month (e.g. the same statement saved under another file name)
-      const weekNorm = (w) => String(w || "").replace(/\s+/g, " ").trim().toLowerCase();
-      const sameWeek =
-        existing &&
-        pf.periodType === "weekly" &&
-        row.week_label &&
-        String(existing.week_label || "")
-          .split(",")
-          .map(weekNorm)
-          .includes(weekNorm(row.week_label));
-      if (existing && sameWeek && !refs.includes(ref) && !opts.replace) {
-        throw new AppError(
-          `${pf.platform} statement for ${g.outlet_id} "${row.week_label}" is already counted in ${g.month}. Nothing was added. Re-send with replace=true to overwrite the ${g.month} statement with "${pf.file.originalname}".`,
-          409,
-          [{ fileName: pf.file.originalname, outletId: g.outlet_id, month: g.month, platform: pf.platform, week: row.week_label }]
-        );
-      }
-
       if (existing && refs.includes(ref) && !opts.replace) {
         throw new AppError(`"${pf.file.originalname}" was already uploaded. Re-send with replace=true to overwrite.`, 409, [
           { fileName: pf.file.originalname, outletId: g.outlet_id, month: g.month, platform: pf.platform },
@@ -346,7 +333,7 @@ const uploadPayoutFiles = async (userId, files, opts) => {
       }
 
       const accumulate =
-        existing && !refs.includes(ref) && !sameWeek && pf.periodType === "weekly" && existing.period_type === "weekly";
+        existing && !refs.includes(ref) && pf.periodType === "weekly" && existing.period_type === "weekly";
       if (existing && !accumulate && !opts.replace) {
         throw new AppError(
           `${pf.platform} payout for ${g.outlet_id} ${g.month} already exists. Re-send with replace=true to overwrite it with "${pf.file.originalname}".`,
